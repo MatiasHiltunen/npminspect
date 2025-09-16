@@ -1,5 +1,7 @@
 # npminspect
 
+*Note: This tool is created in assistance with gpt-5, use with caution as this is still work in progress*
+
 Traverse a directory tree to discover npm dependencies from `package.json` and common lockfiles. Outputs either a compact table or JSON inventory with requested ranges, resolved versions, and file occurrences.
 
 ## Install
@@ -114,7 +116,4 @@ Invalid regex patterns fall back to a literal match of the provided string.
 - Lockfile parsing is intentionally conservative and may not capture every edge case across ecosystems.
 - Currently does not parse Yarn Berry (v2+) lockfile format.
 
----
-
-Issues and contributions are welcome.
 
