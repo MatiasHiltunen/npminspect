@@ -37,6 +37,14 @@ struct Cli {
     #[arg(long)]
     follow_symlinks: bool,
 
+    /// Include only packages that match any of these regex patterns. Repeatable.
+    #[arg(short = 'i', long = "include", value_name = "REGEX")]
+    includes: Vec<String>,
+
+    /// Exclude packages that match any of these regex patterns. Repeatable.
+    #[arg(short = 'x', long = "exclude", value_name = "REGEX")]
+    excludes: Vec<String>,
+
     /// Write output to a file (use '-' for stdout)
     #[arg(short, long, value_name="FILE")]
     output: Option<PathBuf>,
@@ -66,7 +74,7 @@ enum SourceKind {
     PnpmLock,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 struct PackageAggregate {
     /// Unique set of resolved versions seen in lockfiles (if any)
     resolved_versions: BTreeSet<String>,
@@ -75,7 +83,7 @@ struct PackageAggregate {
     occurrences: Vec<Occurrence>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 struct Inventory {
     /// name -> aggregate data
     packages: BTreeMap<String, PackageAggregate>,
@@ -83,7 +91,7 @@ struct Inventory {
     errors: Vec<ScanError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ScanError {
     file: String,
     message: String,
@@ -146,7 +154,7 @@ fn main() -> Result<()> {
         .par_iter()
         .map(|path| {
             let path_str = path.to_string_lossy().to_string();
-            match parse_file(path) {
+            match parse_file(path, cli.include_non_runtime) {
                 Ok(parsed) => (Some((path_str, parsed)), None),
                 Err(e) => (
                     None,
@@ -168,6 +176,17 @@ fn main() -> Result<()> {
             merge_parsed(&mut inventory, &path, parsed);
         }
     }
+
+    // Optional filtering
+    let inventory = {
+        let includes = compile_patterns(&cli.includes);
+        let excludes = compile_patterns(&cli.excludes);
+        if !includes.is_empty() || !excludes.is_empty() {
+            filter_inventory(&inventory, &includes, &excludes)
+        } else {
+            inventory
+        }
+    };
 
     // Print or write to file
     if let Some(path) = &cli.output {
@@ -241,6 +260,40 @@ fn render_table(inv: &Inventory) -> String {
     out
 }
 
+fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
+    let mut out = Vec::new();
+    for p in patterns {
+        match Regex::new(p) {
+            Ok(rx) => out.push(rx),
+            Err(_) => {
+                // Fallback to literal match if regex fails
+                let lit = regex::escape(p);
+                if let Ok(rx) = Regex::new(&lit) {
+                    out.push(rx);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn filter_inventory(inv: &Inventory, includes: &[Regex], excludes: &[Regex]) -> Inventory {
+    let mut filtered = Inventory::default();
+    filtered.errors = inv.errors.clone();
+    for (name, agg) in &inv.packages {
+        // Inclusion logic: if includes present, must match at least one
+        if !includes.is_empty() && !includes.iter().any(|rx| rx.is_match(name)) {
+            continue;
+        }
+        // Exclusion logic: skip if matches any exclude
+        if !excludes.is_empty() && excludes.iter().any(|rx| rx.is_match(name)) {
+            continue;
+        }
+        filtered.packages.insert(name.clone(), agg.clone());
+    }
+    filtered
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -260,11 +313,11 @@ enum ParsedArtifact {
     NpmShrinkwrap(HashMap<String, String>),
 }
 
-fn parse_file(path: &Path) -> Result<ParsedArtifact, ParseErr> {
+fn parse_file(path: &Path, include_non_runtime: bool) -> Result<ParsedArtifact, ParseErr> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let data = fs::read(path).map_err(|e| ParseErr::Io(e.to_string()))?;
     match name {
-        "package.json" => parse_package_json(&data),
+        "package.json" => parse_package_json(&data, include_non_runtime),
         "package-lock.json" => parse_package_lock(&data),
         "npm-shrinkwrap.json" => parse_package_lock(&data).and_then(|p| match p {
             ParsedArtifact::PackageLock(map) => Ok(ParsedArtifact::NpmShrinkwrap(map)),
@@ -317,11 +370,21 @@ fn merge_lock(
 
 // ---------- Parsers ----------
 
-fn parse_package_json(bytes: &[u8]) -> Result<ParsedArtifact, ParseErr> {
+fn parse_package_json(bytes: &[u8], include_non_runtime: bool) -> Result<ParsedArtifact, ParseErr> {
     let v: Json = serde_json::from_slice(bytes)
         .map_err(|e| ParseErr::Json(format!("package.json: {e}")))?;
     let mut map = HashMap::new();
-    for key in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
+    let base_keys = ["dependencies"]; // runtime only
+    let extra_keys = ["devDependencies", "peerDependencies", "optionalDependencies"];
+    let keys: Vec<&str> = if include_non_runtime {
+        base_keys
+            .into_iter()
+            .chain(extra_keys.into_iter())
+            .collect()
+    } else {
+        base_keys.into_iter().collect()
+    };
+    for key in keys {
         if let Some(obj) = v.get(key).and_then(|j| j.as_object()) {
             for (name, spec) in obj {
                 if let Some(spec_str) = spec.as_str() {
