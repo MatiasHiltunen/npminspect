@@ -1,0 +1,22 @@
+# Cargo.toml
+[package]
+name = "npminspect"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"           # respects .gitignore and is fast
+rayon = "1"               # parallel file scanning
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+walkdir = "2"
+thiserror = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
