@@ -15,6 +15,11 @@ Traverse a directory tree to discover npm dependencies from `package.json` and c
 
 `npminspect [OPTIONS] [PATH]`
 
+fe.
+```sh
+npminspect --no-gitignore --include react --format json -o deps.json
+```
+
 - `PATH`: root directory to scan (defaults to `.`)
 
 ### Options
