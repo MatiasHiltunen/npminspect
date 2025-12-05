@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+colored = "2"             # terminal colors
 ignore = "0.4"           # respects .gitignore and is fast
 rayon = "1"               # parallel file scanning
 regex = "1"

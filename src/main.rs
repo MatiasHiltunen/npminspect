@@ -1,5 +1,6 @@
 // src/main.rs
 mod audit;
+mod tree;
 
 use anyhow::Result;
 use audit::{audit_packages, format_severity, AuditResult};
@@ -16,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+use tree::{parse_dependency_graph, print_dependency_tree, print_vulnerable_paths, DependencyGraph};
 
 #[derive(Parser, Debug)]
 #[command(name="npminspect", version, about="Traverse directories to aggregate npm packages and versions from package.json and lockfiles")]
@@ -55,12 +57,20 @@ struct Cli {
     /// Check for security vulnerabilities using npm registry
     #[arg(long)]
     audit: bool,
+
+    /// Maximum depth for tree output (default: 3)
+    #[arg(long, default_value_t = 3)]
+    depth: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Format {
     Table,
     Json,
+    /// Dependency tree with colored vulnerability indicators
+    Tree,
+    /// Show only paths to vulnerable packages
+    Paths,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +109,9 @@ struct Inventory {
     /// Security audit results (if --audit was used)
     #[serde(skip_serializing_if = "Option::is_none")]
     audit: Option<AuditResult>,
+    /// Dependency graph (not serialized, used for tree output)
+    #[serde(skip)]
+    dep_graph: Option<DependencyGraph>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -198,9 +211,18 @@ fn main() -> Result<()> {
         }
     };
 
-    // Security audit (if requested)
-    if cli.audit {
+    // Security audit (if requested, or required for tree/paths format)
+    let needs_audit = cli.audit || matches!(cli.format, Format::Tree | Format::Paths);
+    if needs_audit {
         inventory.audit = run_security_audit(&inventory);
+    }
+
+    // Parse dependency graph for tree formats
+    if matches!(cli.format, Format::Tree | Format::Paths) {
+        inventory.dep_graph = find_and_parse_lockfile(&interesting);
+        if inventory.dep_graph.is_none() {
+            eprintln!("⚠ No package-lock.json found. Tree view requires a lockfile.");
+        }
     }
 
     // Print or write to file
@@ -208,6 +230,11 @@ fn main() -> Result<()> {
         let buf = match cli.format {
             Format::Json => serde_json::to_string_pretty(&inventory)?,
             Format::Table => render_table(&inventory),
+            Format::Tree | Format::Paths => {
+                // Tree formats don't support file output well (colors are ANSI codes)
+                eprintln!("⚠ Tree/Paths format is best viewed in terminal. Writing without colors.");
+                render_table(&inventory) // Fallback to table for file output
+            }
         };
         if path.as_os_str() == "-" {
             println!("{}", buf);
@@ -218,6 +245,20 @@ fn main() -> Result<()> {
         match cli.format {
             Format::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
             Format::Table => print_table(&inventory),
+            Format::Tree => {
+                if let Some(graph) = &inventory.dep_graph {
+                    print_dependency_tree(graph, inventory.audit.as_ref(), cli.depth);
+                } else {
+                    print_table(&inventory);
+                }
+            }
+            Format::Paths => {
+                if let Some(graph) = &inventory.dep_graph {
+                    print_vulnerable_paths(graph, inventory.audit.as_ref());
+                } else {
+                    eprintln!("Cannot show vulnerability paths without a lockfile.");
+                }
+            }
         }
     }
     Ok(())
@@ -665,6 +706,23 @@ fn extract_package_name_from_lockfile_path(path: &str) -> Option<String> {
             Some(name.to_string())
         }
     }
+}
+
+// ---------- Dependency Graph ----------
+
+/// Finds and parses the first package-lock.json to build a dependency graph.
+fn find_and_parse_lockfile(files: &[PathBuf]) -> Option<DependencyGraph> {
+    for path in files {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name == "package-lock.json" {
+            if let Ok(data) = fs::read(path) {
+                if let Some(graph) = parse_dependency_graph(&data) {
+                    return Some(graph);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------- Security Audit ----------

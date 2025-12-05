@@ -24,7 +24,12 @@ _Note that the audit is best to run in single project, if ran in a folder with m
 
 ### Options
 
-- `--format <table|json>`: Output format (default: `table`).
+- `--format <table|json|tree|paths>`: Output format (default: `table`).
+  - `table`: Flat list of packages with requested/resolved versions.
+  - `json`: Machine-readable JSON output.
+  - `tree`: Colored dependency tree with vulnerability indicators.
+  - `paths`: Show only dependency paths to vulnerable packages.
+- `--depth <N>`: Maximum depth for tree output (default: `3`).
 - `--include-non-runtime <true|false>`: Include `dev/peer/optional` deps from `package.json` (default: `true`). Set to `false` to include only runtime `dependencies`.
 - `--no-gitignore`: Do not respect `.gitignore` files.
 - `--follow-symlinks`: Follow symlinks while walking.
@@ -53,6 +58,12 @@ _Note that the audit is best to run in single project, if ran in a folder with m
   - `npminspect --audit`
 - Audit with JSON output:
   - `npminspect --audit --format json -o audit-report.json`
+- Colored dependency tree with vulnerabilities highlighted:
+  - `npminspect --format tree`
+- Deeper tree view (5 levels):
+  - `npminspect --format tree --depth 5`
+- Show only paths to vulnerable packages:
+  - `npminspect --format paths`
 
 ## Output
 
@@ -99,6 +110,48 @@ Stable machine-readable structure:
 ```
 
 Note: The `audit` field is only present when `--audit` is used.
+
+### Tree
+
+Dependency tree showing the full dependency hierarchy. Vulnerable packages are highlighted with colored indicators:
+
+```
+myproject
+├── lodash@4.17.15
+├── axios@0.21.0
+│   ├── follow-redirects@1.14.0
+│   └── ● is-buffer@2.0.0          ← vulnerable (moderate)
+└── express@4.17.1
+    ├── accepts@1.3.7
+    └── ● body-parser@1.19.0       ← vulnerable (high)
+        └── ...
+
+Vulnerability Legend:
+  ● = critical (bright red)
+  ● = high (red)
+  ● = moderate (yellow)
+  ● = low (blue)
+```
+
+Use `--depth N` to control how deep the tree renders (default: 3).
+
+### Paths
+
+Shows only the dependency chains that lead to vulnerable packages, making it easy to identify which direct dependency is responsible:
+
+```
+Dependency paths to vulnerable packages:
+
+● is-buffer [MODERATE]
+   → axios@0.21.0
+   └─ is-buffer@2.0.0
+
+● body-parser [HIGH]
+   → express@4.17.1
+   └─ body-parser@1.19.0
+```
+
+This format automatically runs `--audit` to find vulnerabilities.
 
 ## Security Audit
 
