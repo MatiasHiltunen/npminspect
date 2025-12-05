@@ -1,5 +1,8 @@
 // src/main.rs
+mod audit;
+
 use anyhow::Result;
+use audit::{audit_packages, format_severity, AuditResult};
 use clap::{ArgAction, Parser, ValueEnum};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -48,6 +51,10 @@ struct Cli {
     /// Write output to a file (use '-' for stdout)
     #[arg(short, long, value_name="FILE")]
     output: Option<PathBuf>,
+
+    /// Check for security vulnerabilities using npm registry
+    #[arg(long)]
+    audit: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -89,6 +96,9 @@ struct Inventory {
     packages: BTreeMap<String, PackageAggregate>,
     /// files that failed to parse (non-fatal)
     errors: Vec<ScanError>,
+    /// Security audit results (if --audit was used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit: Option<AuditResult>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -178,7 +188,7 @@ fn main() -> Result<()> {
     }
 
     // Optional filtering
-    let inventory = {
+    let mut inventory = {
         let includes = compile_patterns(&cli.includes);
         let excludes = compile_patterns(&cli.excludes);
         if !includes.is_empty() || !excludes.is_empty() {
@@ -187,6 +197,11 @@ fn main() -> Result<()> {
             inventory
         }
     };
+
+    // Security audit (if requested)
+    if cli.audit {
+        inventory.audit = run_security_audit(&inventory);
+    }
 
     // Print or write to file
     if let Some(path) = &cli.output {
@@ -245,6 +260,13 @@ fn render_table(inv: &Inventory) -> String {
             );
         }
     }
+
+    // Render audit results if available
+    if let Some(audit) = &inv.audit {
+        out.push('\n');
+        render_audit_table(&mut out, audit);
+    }
+
     if !inv.errors.is_empty() {
         out.push_str("\nNon-fatal parse errors:\n");
         out.push_str("───────────────────────\n");
@@ -258,6 +280,60 @@ fn render_table(inv: &Inventory) -> String {
         }
     }
     out
+}
+
+fn render_audit_table(out: &mut String, audit: &AuditResult) {
+    use std::fmt::Write;
+
+    out.push_str("Security Audit Results:\n");
+    out.push_str("══════════════════════════════════════════════════════════════════════════════\n");
+
+    if audit.advisories.is_empty() {
+        out.push_str("✓ No known vulnerabilities found.\n");
+        return;
+    }
+
+    // Summary line
+    let _ = writeln!(
+        out,
+        "Found {} vulnerabilities: {} critical, {} high, {} moderate, {} low, {} info\n",
+        audit.summary.total,
+        audit.summary.critical,
+        audit.summary.high,
+        audit.summary.moderate,
+        audit.summary.low,
+        audit.summary.info
+    );
+
+    // Group by severity for ordered output (critical first)
+    let severity_order = ["critical", "high", "moderate", "low", "info"];
+
+    for severity in severity_order {
+        let matching: Vec<_> = audit
+            .advisories
+            .iter()
+            .flat_map(|(pkg, advisories)| {
+                advisories
+                    .iter()
+                    .filter(|a| a.severity.to_lowercase() == severity)
+                    .map(move |a| (pkg, a))
+            })
+            .collect();
+
+        if matching.is_empty() {
+            continue;
+        }
+
+        let _ = writeln!(out, "┌─ {} ─", format_severity(severity));
+        for (pkg, advisory) in matching {
+            let _ = writeln!(out, "│");
+            let _ = writeln!(out, "│  Package: {}", pkg);
+            let _ = writeln!(out, "│  Title:   {}", advisory.title);
+            let _ = writeln!(out, "│  Range:   {}", advisory.vulnerable_versions);
+            let _ = writeln!(out, "│  More:    {}", advisory.url);
+        }
+        out.push_str("└──────────────────────────────────────────────────────────────────────────────\n");
+    }
 }
 
 fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
@@ -541,4 +617,57 @@ fn split_pnpm_key(key: &str) -> Option<(&str, &str)> {
     let (name, ver) = k.split_at(last_at);
     let ver = &ver[1..]; // skip '@'
     Some((name, ver))
+}
+
+// ---------- Security Audit ----------
+
+/// Runs the security audit against the npm registry using the bulk advisory API.
+/// Returns None if no packages have resolved versions, or if the audit fails.
+fn run_security_audit(inventory: &Inventory) -> Option<AuditResult> {
+    // Build a map of package name -> resolved versions for the audit
+    let packages_to_audit: BTreeMap<String, BTreeSet<String>> = inventory
+        .packages
+        .iter()
+        .filter(|(_, agg)| !agg.resolved_versions.is_empty())
+        .map(|(name, agg)| (name.clone(), agg.resolved_versions.clone()))
+        .collect();
+
+    if packages_to_audit.is_empty() {
+        eprintln!("⚠ No resolved versions found to audit. Run with a lockfile for accurate results.");
+        return None;
+    }
+
+    let pkg_count = packages_to_audit.len();
+    eprintln!("🔍 Auditing {} packages for vulnerabilities...", pkg_count);
+
+    // Create a tokio runtime for the async audit call
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("✗ Failed to initialize async runtime: {}", e);
+            return None;
+        }
+    };
+
+    match runtime.block_on(audit_packages(&packages_to_audit)) {
+        Ok(result) => {
+            if result.summary.has_vulnerabilities() {
+                eprintln!(
+                    "⚠ Found {} vulnerabilities ({} critical, {} high, {} moderate, {} low)",
+                    result.summary.total,
+                    result.summary.critical,
+                    result.summary.high,
+                    result.summary.moderate,
+                    result.summary.low
+                );
+            } else {
+                eprintln!("✓ No vulnerabilities found");
+            }
+            Some(result)
+        }
+        Err(e) => {
+            eprintln!("✗ Security audit failed: {}", e);
+            None
+        }
+    }
 }
