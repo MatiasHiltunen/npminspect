@@ -17,9 +17,9 @@ Traverse a directory tree to discover npm dependencies from `package.json` and c
 
 fe.
 ```sh
-npminspect --no-gitignore --include react --format json -o deps.json
+npminspect --audit --no-gitignore --follow-symlinks --format json -o report.json
 ```
-
+_Note that the audit is best to run in single project, if ran in a folder with multiple projects it might take a while to complete to scan every project with bulk audit. Audit is can only find packages that are listed to be vulnerable in npm registry_
 - `PATH`: root directory to scan (defaults to `.`)
 
 ### Options
