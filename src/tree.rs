@@ -3,14 +3,27 @@
 
 use crate::audit::AuditResult;
 use colored::Colorize;
+use regex::Regex;
 use serde_json::Value as Json;
+use serde_yaml::Value as Yaml;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// The type of lockfile that was parsed.
+#[derive(Debug, Clone, Default)]
+pub enum LockfileType {
+    #[default]
+    PackageLock,
+    YarnLock,
+    PnpmLock,
+}
 
 /// Represents the dependency graph extracted from a lockfile.
 #[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     /// Package name -> version
     pub packages: BTreeMap<String, String>,
+    /// Package name -> lockfile path (e.g., "node_modules/@eslint/eslintrc")
+    pub package_paths: BTreeMap<String, String>,
     /// Package name -> set of packages it depends on
     pub dependencies: BTreeMap<String, BTreeSet<String>>,
     /// Package name -> set of packages that depend on it (reverse lookup)
@@ -19,6 +32,10 @@ pub struct DependencyGraph {
     pub root_deps: BTreeSet<String>,
     /// Root project name (if found)
     pub root_name: Option<String>,
+    /// Base path where the lockfile was found
+    pub base_path: Option<String>,
+    /// Type of lockfile this was parsed from
+    pub lockfile_type: LockfileType,
 }
 
 impl DependencyGraph {
@@ -26,12 +43,18 @@ impl DependencyGraph {
     pub fn get_version(&self, name: &str) -> Option<&String> {
         self.packages.get(name)
     }
+
+    /// Get the file system path for a package.
+    pub fn get_path(&self, name: &str) -> Option<&String> {
+        self.package_paths.get(name)
+    }
 }
 
 /// Parses a package-lock.json (v2+) and extracts the full dependency graph.
-pub fn parse_dependency_graph(bytes: &[u8]) -> Option<DependencyGraph> {
+pub fn parse_dependency_graph(bytes: &[u8], base_path: Option<&str>) -> Option<DependencyGraph> {
     let v: Json = serde_json::from_slice(bytes).ok()?;
     let mut graph = DependencyGraph::default();
+    graph.base_path = base_path.map(|s| s.to_string());
 
     // Get root package info
     if let Some(root) = v.get("packages").and_then(|p| p.get("")) {
@@ -73,6 +96,7 @@ pub fn parse_dependency_graph(bytes: &[u8]) -> Option<DependencyGraph> {
                 None => continue, // Skip packages with non-standard paths
             };
             graph.packages.insert(name.clone(), version);
+            graph.package_paths.insert(name.clone(), path.clone());
 
             // Extract this package's dependencies
             let mut deps = BTreeSet::new();
@@ -99,6 +123,177 @@ pub fn parse_dependency_graph(bytes: &[u8]) -> Option<DependencyGraph> {
     }
 
     Some(graph)
+}
+
+/// Parses a pnpm-lock.yaml and extracts the dependency graph.
+pub fn parse_pnpm_dependency_graph(bytes: &[u8], base_path: Option<&str>) -> Option<DependencyGraph> {
+    let y: Yaml = serde_yaml::from_slice(bytes).ok()?;
+    let mut graph = DependencyGraph::default();
+    graph.base_path = base_path.map(|s| s.to_string());
+    graph.lockfile_type = LockfileType::PnpmLock;
+
+    // Get root package info from importers or root
+    if let Some(importers) = y.get("importers").and_then(|i| i.as_mapping()) {
+        if let Some(root) = importers.get(&Yaml::String(".".to_string())) {
+            // Direct dependencies
+            for dep_key in ["dependencies", "devDependencies", "optionalDependencies"] {
+                if let Some(deps) = root.get(dep_key).and_then(|d| d.as_mapping()) {
+                    for (name, _) in deps {
+                        if let Some(name_str) = name.as_str() {
+                            graph.root_deps.insert(name_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse all packages
+    if let Some(packages) = y.get("packages").and_then(|p| p.as_mapping()) {
+        for (key, pkg) in packages {
+            let key_str = match key.as_str() {
+                Some(k) => k,
+                None => continue,
+            };
+
+            // Parse key like "/lodash@4.17.21" or "/@scope/name@1.2.3"
+            let (name, version) = match split_pnpm_key(key_str) {
+                Some((n, v)) => (n.to_string(), v.to_string()),
+                None => continue,
+            };
+
+            graph.packages.insert(name.clone(), version);
+            graph.package_paths.insert(name.clone(), format!("node_modules/{}", name));
+
+            // Extract dependencies
+            let mut deps = BTreeSet::new();
+            for dep_key in ["dependencies", "optionalDependencies", "peerDependencies"] {
+                if let Some(dep_obj) = pkg.get(dep_key).and_then(|d| d.as_mapping()) {
+                    for (dep_name, _) in dep_obj {
+                        if let Some(dep_name_str) = dep_name.as_str() {
+                            deps.insert(dep_name_str.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Build forward and reverse lookups
+            for dep in &deps {
+                graph.dependents.entry(dep.clone()).or_default().insert(name.clone());
+            }
+            if !deps.is_empty() {
+                graph.dependencies.insert(name, deps);
+            }
+        }
+    }
+
+    Some(graph)
+}
+
+fn split_pnpm_key(key: &str) -> Option<(&str, &str)> {
+    let k = key.trim_start_matches('/');
+    let last_at = k.rfind('@')?;
+    if last_at == 0 {
+        return None; // Scoped package needs more parsing
+    }
+    let (name, ver) = k.split_at(last_at);
+    let ver = &ver[1..]; // skip '@'
+    // Handle version suffixes like "4.17.21(patch_hash=...)"
+    let ver = ver.split('(').next().unwrap_or(ver);
+    Some((name, ver))
+}
+
+/// Parses a yarn.lock (v1/classic) and extracts the dependency graph.
+pub fn parse_yarn_dependency_graph(bytes: &[u8], base_path: Option<&str>) -> Option<DependencyGraph> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut graph = DependencyGraph::default();
+    graph.base_path = base_path.map(|s| s.to_string());
+    graph.lockfile_type = LockfileType::YarnLock;
+
+    // Regex patterns for yarn.lock parsing
+    let re_key = Regex::new(r#"^([^\s].*?):\s*$"#).ok()?;
+    let re_version = Regex::new(r#"^\s+version\s+"([^"]+)""#).ok()?;
+    let re_deps_start = Regex::new(r#"^\s+dependencies:\s*$"#).ok()?;
+    let re_dep_entry = Regex::new(r#"^\s{4}"?([^"\s]+)"?\s+"#).ok()?;
+
+    let mut current_names: Vec<String> = Vec::new();
+    let mut current_version: Option<String> = None;
+    let mut current_deps: BTreeSet<String> = BTreeSet::new();
+    let mut in_deps_block = false;
+
+    for line in text.lines() {
+        // New package block
+        if let Some(cap) = re_key.captures(line) {
+            // Commit previous block
+            if let Some(ver) = current_version.take() {
+                for spec in current_names.drain(..) {
+                    if let Some(name) = extract_yarn_package_name(&spec) {
+                        graph.packages.entry(name.clone()).or_insert_with(|| ver.clone());
+                        graph.package_paths.entry(name.clone()).or_insert_with(|| format!("node_modules/{}", name));
+                        
+                        if !current_deps.is_empty() {
+                            for dep in &current_deps {
+                                graph.dependents.entry(dep.clone()).or_default().insert(name.clone());
+                            }
+                            graph.dependencies.entry(name).or_insert_with(|| current_deps.clone());
+                        }
+                    }
+                }
+            }
+            current_deps.clear();
+            in_deps_block = false;
+
+            // Start new block
+            let raw = cap[1].trim().trim_matches('"');
+            current_names = raw.split(", ").map(|s| s.trim().to_string()).collect();
+            current_version = None;
+        } else if let Some(cap) = re_version.captures(line) {
+            current_version = Some(cap[1].to_string());
+            in_deps_block = false;
+        } else if re_deps_start.is_match(line) {
+            in_deps_block = true;
+        } else if in_deps_block {
+            if let Some(cap) = re_dep_entry.captures(line) {
+                current_deps.insert(cap[1].to_string());
+            } else if !line.starts_with("    ") && !line.trim().is_empty() {
+                in_deps_block = false;
+            }
+        }
+    }
+
+    // Final block
+    if let Some(ver) = current_version {
+        for spec in current_names {
+            if let Some(name) = extract_yarn_package_name(&spec) {
+                graph.packages.entry(name.clone()).or_insert(ver.clone());
+                graph.package_paths.entry(name.clone()).or_insert_with(|| format!("node_modules/{}", name));
+                
+                if !current_deps.is_empty() {
+                    for dep in &current_deps {
+                        graph.dependents.entry(dep.clone()).or_default().insert(name.clone());
+                    }
+                    graph.dependencies.entry(name).or_insert_with(|| current_deps.clone());
+                }
+            }
+        }
+    }
+
+    Some(graph)
+}
+
+fn extract_yarn_package_name(spec: &str) -> Option<String> {
+    let s = spec.trim().trim_matches('"');
+    if s.starts_with('@') {
+        // Scoped: @scope/name@version
+        let mut parts = s.splitn(3, '@');
+        let _empty = parts.next();
+        let scope = parts.next()?;
+        let _rest = parts.next()?;
+        Some(format!("@{}", scope.split('@').next().unwrap_or(scope)))
+    } else {
+        // Unscoped: name@version
+        s.split('@').next().map(|x| x.to_string())
+    }
 }
 
 /// Extracts package name from lockfile path.
@@ -569,6 +764,7 @@ pub fn print_vulnerable_paths(graph: &DependencyGraph, audit: Option<&AuditResul
     println!("{}\n", "Dependency paths to vulnerable packages:".bold());
 
     let mut shown_vuln: HashSet<String> = HashSet::new();
+    let mut untraced: Vec<(String, String)> = Vec::new();
 
     for (vuln_pkg, severity) in &vulnerable_packages {
         if shown_vuln.contains(vuln_pkg) {
@@ -579,8 +775,15 @@ pub fn print_vulnerable_paths(graph: &DependencyGraph, audit: Option<&AuditResul
         let paths = find_paths_to_package(graph, vuln_pkg);
 
         if paths.is_empty() {
-            // No path found - show the vulnerable package directly
-            print_vulnerability_no_path(vuln_pkg, severity, graph);
+            // Check if the package exists in the graph at all
+            if graph.packages.contains_key(vuln_pkg) {
+                // Package exists but no path from root deps
+                print_vulnerability_no_path(vuln_pkg, severity, graph);
+                println!();
+            } else {
+                // Package not in graph - collect for summary at end
+                untraced.push((vuln_pkg.clone(), severity.clone()));
+            }
         } else {
             // Show header for this vulnerability
             print_vulnerability_header(vuln_pkg, severity, graph, paths.len());
@@ -589,8 +792,50 @@ pub fn print_vulnerable_paths(graph: &DependencyGraph, audit: Option<&AuditResul
             for path in paths {
                 print_compact_path(&path, vuln_pkg, severity, graph);
             }
+            println!();
         }
-        println!();
+    }
+
+    // Show untraced vulnerabilities at the end with explanation (only if they have a path on disk)
+    if !untraced.is_empty() {
+        // Filter to only packages that actually have a path (exist somewhere)
+        let real_untraced: Vec<_> = untraced
+            .into_iter()
+            .filter(|(pkg, _)| graph.package_paths.contains_key(pkg))
+            .collect();
+        
+        if !real_untraced.is_empty() {
+            println!("{}", "Vulnerabilities found but dependency path unclear:".yellow().bold());
+            println!("{}", "These packages exist but the dependency chain couldn't be traced.".dimmed());
+            println!();
+            for (vuln_pkg, severity) in real_untraced {
+                let indicator = get_severity_indicator(&severity);
+                let severity_label = match severity.to_lowercase().as_str() {
+                    "critical" => "CRITICAL".bright_red().bold(),
+                    "high" => "HIGH".red().bold(),
+                    "moderate" => "MODERATE".yellow(),
+                    "low" => "LOW".blue(),
+                    _ => "UNKNOWN".white(),
+                };
+                let pkg_colored = colorize_by_severity(&vuln_pkg, &severity);
+                
+                // Show path if available
+                if let Some(rel_path) = graph.get_path(&vuln_pkg) {
+                    let full_path = if let Some(base) = &graph.base_path {
+                        format!("{}/{}", base, rel_path).replace('/', std::path::MAIN_SEPARATOR_STR)
+                    } else {
+                        rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)
+                    };
+                    let version = graph.get_version(&vuln_pkg).map(|v| v.as_str()).unwrap_or("?");
+                    println!("   {} {}@{} [{}]", indicator, pkg_colored, version.dimmed(), severity_label);
+                    println!("      {} {}", "Path:".dimmed(), full_path);
+                } else {
+                    println!("   {} {} [{}]", indicator, pkg_colored, severity_label);
+                }
+            }
+            println!();
+            println!("{}", "Tip: Run 'npm ls <package-name>' to find the dependency chain.".dimmed());
+        }
     }
 }
 
@@ -608,6 +853,17 @@ fn print_vulnerability_header(vuln_pkg: &str, severity: &str, graph: &Dependency
     let pkg_colored = colorize_by_severity(vuln_pkg, severity);
     
     println!("{} {}@{} [{}]", indicator, pkg_colored, version.dimmed(), severity_label);
+    
+    // Show the full OS path to the vulnerable package
+    if let Some(rel_path) = graph.get_path(vuln_pkg) {
+        let full_path = if let Some(base) = &graph.base_path {
+            format!("{}/{}", base, rel_path).replace('/', std::path::MAIN_SEPARATOR_STR)
+        } else {
+            rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)
+        };
+        println!("   {} {}", "Path:".dimmed(), full_path);
+    }
+    
     println!("   {} {} direct {} pull this in:", 
         "→".dimmed(), 
         path_count,
@@ -646,10 +902,20 @@ fn print_vulnerability_no_path(vuln_pkg: &str, severity: &str, graph: &Dependenc
     };
 
     let version = graph.get_version(vuln_pkg).map(|v| v.as_str()).unwrap_or("?");
-    let pkg_display = colorize_by_severity(&format!("{}@{}", vuln_pkg, version), severity);
+    let pkg_colored = colorize_by_severity(vuln_pkg, severity);
 
-    println!("{} {} [{}]", indicator, vuln_pkg.bold(), severity_label);
-    println!("   {} {}", "→".dimmed(), pkg_display);
+    println!("{} {}@{} [{}]", indicator, pkg_colored, version.dimmed(), severity_label);
+    
+    // Show the full OS path to the vulnerable package
+    if let Some(rel_path) = graph.get_path(vuln_pkg) {
+        let full_path = if let Some(base) = &graph.base_path {
+            format!("{}/{}", base, rel_path).replace('/', std::path::MAIN_SEPARATOR_STR)
+        } else {
+            rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)
+        };
+        println!("   {} {}", "Path:".dimmed(), full_path);
+    }
+    
     println!("   {}", "(direct or untraced dependency)".dimmed());
 }
 

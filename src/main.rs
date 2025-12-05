@@ -17,7 +17,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
-use tree::{parse_dependency_graph, print_dependency_tree, print_vulnerable_paths, DependencyGraph};
+use tree::{
+    parse_dependency_graph, parse_pnpm_dependency_graph, parse_yarn_dependency_graph,
+    print_dependency_tree, print_vulnerable_paths, DependencyGraph,
+};
 
 #[derive(Parser, Debug)]
 #[command(name="npminspect", version, about="Traverse directories to aggregate npm packages and versions from package.json and lockfiles")]
@@ -710,19 +713,101 @@ fn extract_package_name_from_lockfile_path(path: &str) -> Option<String> {
 
 // ---------- Dependency Graph ----------
 
-/// Finds and parses the first package-lock.json to build a dependency graph.
+/// Finds and parses lockfiles to build a merged dependency graph.
+/// Tries package-lock.json first, then pnpm-lock.yaml, then yarn.lock.
 fn find_and_parse_lockfile(files: &[PathBuf]) -> Option<DependencyGraph> {
+    let mut merged_graph: Option<DependencyGraph> = None;
+
+    // Group lockfiles by their directory to find all lockfiles per project
+    // Skip lockfiles inside node_modules (these are often stale/internal)
+    let mut lockfiles_by_dir: HashMap<PathBuf, Vec<&PathBuf>> = HashMap::new();
     for path in files {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if name == "package-lock.json" {
-            if let Ok(data) = fs::read(path) {
-                if let Some(graph) = parse_dependency_graph(&data) {
-                    return Some(graph);
-                }
+        let path_str = path.to_string_lossy();
+        
+        // Skip lockfiles inside node_modules directories
+        if path_str.contains("node_modules") {
+            continue;
+        }
+        
+        // Skip hidden lockfiles (like .package-lock.json)
+        if name.starts_with('.') {
+            continue;
+        }
+        
+        if matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "pnpm-lock.yml" | "yarn.lock") {
+            if let Some(dir) = path.parent() {
+                lockfiles_by_dir.entry(dir.to_path_buf()).or_default().push(path);
             }
         }
     }
-    None
+
+    // For each directory, parse all available lockfiles and merge
+    for (dir, lockfiles) in lockfiles_by_dir {
+        let base_path = dir.to_string_lossy().to_string();
+
+        for lockfile in lockfiles {
+            let name = lockfile.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let data = match fs::read(lockfile) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let graph = match name {
+                "package-lock.json" => parse_dependency_graph(&data, Some(&base_path)),
+                "pnpm-lock.yaml" | "pnpm-lock.yml" => parse_pnpm_dependency_graph(&data, Some(&base_path)),
+                "yarn.lock" => parse_yarn_dependency_graph(&data, Some(&base_path)),
+                _ => None,
+            };
+
+            if let Some(g) = graph {
+                merged_graph = Some(match merged_graph {
+                    Some(existing) => merge_dependency_graphs(existing, g),
+                    None => g,
+                });
+            }
+        }
+    }
+
+    merged_graph
+}
+
+/// Merges two dependency graphs, preferring the first graph's data for conflicts.
+fn merge_dependency_graphs(mut a: DependencyGraph, b: DependencyGraph) -> DependencyGraph {
+    // Merge packages (a takes precedence)
+    for (name, version) in b.packages {
+        a.packages.entry(name).or_insert(version);
+    }
+
+    // Merge package paths
+    for (name, path) in b.package_paths {
+        a.package_paths.entry(name).or_insert(path);
+    }
+
+    // Merge dependencies
+    for (name, deps) in b.dependencies {
+        a.dependencies.entry(name).or_insert(deps);
+    }
+
+    // Merge dependents
+    for (name, deps) in b.dependents {
+        let entry = a.dependents.entry(name).or_default();
+        for dep in deps {
+            entry.insert(dep);
+        }
+    }
+
+    // Merge root deps
+    for dep in b.root_deps {
+        a.root_deps.insert(dep);
+    }
+
+    // Keep root name from first graph if present
+    if a.root_name.is_none() {
+        a.root_name = b.root_name;
+    }
+
+    a
 }
 
 // ---------- Security Audit ----------
