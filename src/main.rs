@@ -479,22 +479,30 @@ fn parse_package_lock(bytes: &[u8]) -> Result<ParsedArtifact, ParseErr> {
 
     let mut map = HashMap::new();
 
-    // v2+ format: "packages": { "node_modules/foo": { "version": "1.2.3", "name": "foo" }, ... }
+    // v2+ format: "packages": { "node_modules/foo": { "version": "1.2.3" }, ... }
+    // Note: Most packages don't have an explicit "name" field - extract from path
     if let Some(packages) = v.get("packages").and_then(|p| p.as_object()) {
-        for (_path, pkg) in packages {
+        for (path, pkg) in packages {
             let version = pkg
                 .get("version")
                 .and_then(|s| s.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let name = pkg
-                .get("name")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
+
+            if version.is_empty() {
+                continue;
+            }
+
+            // Try explicit "name" field first (root package and linked packages have this)
+            let name = if let Some(n) = pkg.get("name").and_then(|s| s.as_str()) {
+                Some(n.to_string())
+            } else {
+                // Extract name from path: "node_modules/@scope/pkg" -> "@scope/pkg"
+                extract_package_name_from_lockfile_path(path)
+            };
+
             if let Some(name) = name {
-                if !version.is_empty() {
-                    map.entry(name).or_insert(version);
-                }
+                map.entry(name).or_insert(version);
             }
         }
     }
@@ -617,6 +625,46 @@ fn split_pnpm_key(key: &str) -> Option<(&str, &str)> {
     let (name, ver) = k.split_at(last_at);
     let ver = &ver[1..]; // skip '@'
     Some((name, ver))
+}
+
+/// Extracts package name from a package-lock.json v2+ path.
+///
+/// Examples:
+/// - `node_modules/lodash` → `lodash`
+/// - `node_modules/@babel/core` → `@babel/core`
+/// - `node_modules/foo/node_modules/bar` → `bar` (nested dependency)
+/// - `` (empty, root package) → None (handled separately via "name" field)
+fn extract_package_name_from_lockfile_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None; // Root package, should use explicit "name" field
+    }
+
+    // Find the last "node_modules/" segment to handle nested dependencies
+    let prefix = "node_modules/";
+    let last_nm_idx = path.rfind(prefix)?;
+    let after_nm = &path[last_nm_idx + prefix.len()..];
+
+    if after_nm.is_empty() {
+        return None;
+    }
+
+    // Handle scoped packages: @scope/name
+    if after_nm.starts_with('@') {
+        // Need both @scope and /name parts
+        if after_nm.contains('/') {
+            Some(after_nm.to_string())
+        } else {
+            None // Malformed scoped package
+        }
+    } else {
+        // Unscoped: just the package name (stop at any further path separators)
+        let name = after_nm.split('/').next()?;
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
 }
 
 // ---------- Security Audit ----------
