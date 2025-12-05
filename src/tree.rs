@@ -67,8 +67,11 @@ pub fn parse_dependency_graph(bytes: &[u8]) -> Option<DependencyGraph> {
                 continue;
             }
 
-            // Extract package name from path
-            let name = extract_package_name(path)?;
+            // Extract package name from path - skip if pattern doesn't match
+            let name = match extract_package_name(path) {
+                Some(n) => n,
+                None => continue, // Skip packages with non-standard paths
+            };
             graph.packages.insert(name.clone(), version);
 
             // Extract this package's dependencies
@@ -348,47 +351,69 @@ fn colorize_by_severity(name: &str, severity: &str) -> String {
     }
 }
 
-/// Finds all paths from root dependencies to a target package.
+/// Finds the shortest path from each root dependency to a target package.
+/// Returns one path per direct dependency that leads to the target.
 fn find_paths_to_package(graph: &DependencyGraph, target: &str) -> Vec<Vec<String>> {
-    let mut all_paths = Vec::new();
+    let mut paths_by_root: HashMap<String, Vec<String>> = HashMap::new();
 
-    // For each root dependency, try to find a path to target
+    // For each root dependency, find the shortest path to target using BFS
     for root_dep in &graph.root_deps {
-        let mut current_path = vec![root_dep.clone()];
-        let mut visited = HashSet::new();
-        find_paths_dfs(graph, root_dep, target, &mut current_path, &mut visited, &mut all_paths);
-    }
-
-    all_paths
-}
-
-fn find_paths_dfs(
-    graph: &DependencyGraph,
-    current: &str,
-    target: &str,
-    path: &mut Vec<String>,
-    visited: &mut HashSet<String>,
-    results: &mut Vec<Vec<String>>,
-) {
-    if current == target {
-        results.push(path.clone());
-        return;
-    }
-
-    if visited.contains(current) {
-        return;
-    }
-    visited.insert(current.to_string());
-
-    if let Some(deps) = graph.dependencies.get(current) {
-        for dep in deps {
-            path.push(dep.clone());
-            find_paths_dfs(graph, dep, target, path, visited, results);
-            path.pop();
+        if let Some(path) = find_shortest_path_bfs(graph, root_dep, target) {
+            // Only keep the shortest path for each root dependency
+            let existing = paths_by_root.get(root_dep);
+            if existing.is_none() || existing.unwrap().len() > path.len() {
+                paths_by_root.insert(root_dep.clone(), path);
+            }
         }
     }
 
-    visited.remove(current);
+    // Return paths sorted by length (shortest first)
+    let mut result: Vec<Vec<String>> = paths_by_root.into_values().collect();
+    result.sort_by_key(|p| p.len());
+    result
+}
+
+/// BFS to find the shortest path from start to target.
+fn find_shortest_path_bfs(
+    graph: &DependencyGraph,
+    start: &str,
+    target: &str,
+) -> Option<Vec<String>> {
+    use std::collections::VecDeque;
+
+    if start == target {
+        return Some(vec![start.to_string()]);
+    }
+
+    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    queue.push_back(vec![start.to_string()]);
+    visited.insert(start.to_string());
+
+    while let Some(path) = queue.pop_front() {
+        let current = path.last().unwrap();
+
+        if let Some(deps) = graph.dependencies.get(current) {
+            for dep in deps {
+                if dep == target {
+                    // Found the target - return this path + target
+                    let mut result = path.clone();
+                    result.push(dep.clone());
+                    return Some(result);
+                }
+
+                if !visited.contains(dep) {
+                    visited.insert(dep.clone());
+                    let mut new_path = path.clone();
+                    new_path.push(dep.clone());
+                    queue.push_back(new_path);
+                }
+            }
+        }
+    }
+
+    None // No path found
 }
 
 /// Renders a single vulnerability path (returns String).
@@ -543,24 +568,92 @@ pub fn print_vulnerable_paths(graph: &DependencyGraph, audit: Option<&AuditResul
 
     println!("{}\n", "Dependency paths to vulnerable packages:".bold());
 
-    let mut shown_paths: HashSet<String> = HashSet::new();
+    let mut shown_vuln: HashSet<String> = HashSet::new();
 
     for (vuln_pkg, severity) in &vulnerable_packages {
+        if shown_vuln.contains(vuln_pkg) {
+            continue;
+        }
+        shown_vuln.insert(vuln_pkg.clone());
+
         let paths = find_paths_to_package(graph, vuln_pkg);
 
-        for path in paths {
-            let path_key = path.join(" → ");
-            if shown_paths.contains(&path_key) {
-                continue;
+        if paths.is_empty() {
+            // No path found - show the vulnerable package directly
+            print_vulnerability_no_path(vuln_pkg, severity, graph);
+        } else {
+            // Show header for this vulnerability
+            print_vulnerability_header(vuln_pkg, severity, graph, paths.len());
+            
+            // Show each path (one per direct dependency, shortest path)
+            for path in paths {
+                print_compact_path(&path, vuln_pkg, severity, graph);
             }
-            shown_paths.insert(path_key);
-
-            print_vulnerability_path(&path, vuln_pkg, severity, graph);
-            println!();
         }
+        println!();
     }
 }
 
+fn print_vulnerability_header(vuln_pkg: &str, severity: &str, graph: &DependencyGraph, path_count: usize) {
+    let indicator = get_severity_indicator(severity);
+    let severity_label = match severity.to_lowercase().as_str() {
+        "critical" => "CRITICAL".bright_red().bold(),
+        "high" => "HIGH".red().bold(),
+        "moderate" => "MODERATE".yellow(),
+        "low" => "LOW".blue(),
+        _ => "UNKNOWN".white(),
+    };
+
+    let version = graph.get_version(vuln_pkg).map(|v| v.as_str()).unwrap_or("?");
+    let pkg_colored = colorize_by_severity(vuln_pkg, severity);
+    
+    println!("{} {}@{} [{}]", indicator, pkg_colored, version.dimmed(), severity_label);
+    println!("   {} {} direct {} pull this in:", 
+        "→".dimmed(), 
+        path_count,
+        if path_count == 1 { "dependency" } else { "dependencies" }
+    );
+}
+
+fn print_compact_path(path: &[String], vuln_pkg: &str, severity: &str, graph: &DependencyGraph) {
+    // Format: "     eslint → @eslint/eslintrc → js-yaml@4.1.1"
+    let formatted: Vec<String> = path.iter().map(|pkg| {
+        let is_vuln = pkg == vuln_pkg;
+        let is_first = path.first().map(|s| s.as_str()) == Some(pkg);
+        
+        if is_vuln {
+            let version = graph.get_version(pkg).map(|v| v.as_str()).unwrap_or("?");
+            colorize_by_severity(&format!("{}@{}", pkg, version), severity)
+        } else if is_first {
+            // First item (direct dep) in bold
+            pkg.bold().to_string()
+        } else {
+            pkg.to_string()
+        }
+    }).collect();
+    
+    println!("     {}", formatted.join(&format!(" {} ", "→".dimmed())));
+}
+
+fn print_vulnerability_no_path(vuln_pkg: &str, severity: &str, graph: &DependencyGraph) {
+    let indicator = get_severity_indicator(severity);
+    let severity_label = match severity.to_lowercase().as_str() {
+        "critical" => "CRITICAL".bright_red().bold(),
+        "high" => "HIGH".red().bold(),
+        "moderate" => "MODERATE".yellow(),
+        "low" => "LOW".blue(),
+        _ => "UNKNOWN".white(),
+    };
+
+    let version = graph.get_version(vuln_pkg).map(|v| v.as_str()).unwrap_or("?");
+    let pkg_display = colorize_by_severity(&format!("{}@{}", vuln_pkg, version), severity);
+
+    println!("{} {} [{}]", indicator, vuln_pkg.bold(), severity_label);
+    println!("   {} {}", "→".dimmed(), pkg_display);
+    println!("   {}", "(direct or untraced dependency)".dimmed());
+}
+
+#[allow(dead_code)]
 fn print_vulnerability_path(path: &[String], vuln_pkg: &str, severity: &str, graph: &DependencyGraph) {
     let indicator = get_severity_indicator(severity);
     let severity_label = match severity.to_lowercase().as_str() {
@@ -591,4 +684,3 @@ fn print_vulnerability_path(path: &[String], vuln_pkg: &str, severity: &str, gra
         }
     }
 }
-
